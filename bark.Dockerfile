@@ -55,6 +55,7 @@ FROM docker.io/debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl nginx \
+      rclone sqlite3 inotify-tools jq openssl \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -66,6 +67,10 @@ COPY --from=api-prod-deps /app/api/node_modules /app/api/node_modules
 COPY --from=api-prod-deps /app/api/package.json /app/api/package.json
 COPY --from=api-builder /app/api/dist /app/api/dist
 COPY --from=barkd-fetch /out/barkd /usr/local/bin/barkd
+
+# Continuous external backup agent (see startos/main.ts, backup-agent.sh).
+COPY backup-agent.sh /usr/local/bin/backup-agent.sh
+RUN chmod +x /usr/local/bin/backup-agent.sh
 
 COPY nginx.conf /etc/nginx/sites-available/bark
 RUN rm -f /etc/nginx/sites-enabled/default \

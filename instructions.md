@@ -16,10 +16,13 @@ This package runs Bark on Bitcoin **mainnet**, connected to Second's hosted Ark 
 ## Getting set up
 
 1. On first install StartOS prompts you with the **Set UI Password** task. Run it to generate your login password, then note the username (`admin`) and password — you can re-run the task any time to rotate it.
-2. Open the **Web UI** interface from the service's **Dashboard** tab and log in with those credentials.
-3. Choose **Create wallet** to generate a fresh twelve-word recovery phrase, or **Restore** to import an existing seed.
-4. Write the recovery phrase down and store it safely. If your server is lost, the seed is the only way to recover funds.
-5. Fund the wallet by receiving an on-chain deposit or an Ark payment.
+2. StartOS shows two backup tasks:
+   - a **critical** "Backup Safety" task explains how your wallet is backed up and asks you to acknowledge that you can lose funds without a current external backup and a safeguarded recovery phrase. This is required of everyone and clears only once you acknowledge it; and
+   - an **important** task recommends adding an external target via **Configure Backups** (see [Backups](#backups) below), and clears once you do.
+3. Open the **Web UI** interface from the service's **Dashboard** tab and log in with those credentials.
+4. Choose **Create wallet** to generate a fresh twelve-word recovery phrase, or **Restore** to import an existing seed.
+5. Write the recovery phrase down and store it safely — it is the master key to your funds. With Bark, your seed alone is **not** enough to recover Ark and Lightning balances; your continuous backup is.
+6. Fund the wallet by receiving an on-chain deposit or an Ark payment.
 
 ## Using Bark Wallet
 
@@ -29,7 +32,24 @@ The web UI is the whole experience: check your balance, send and receive across 
 
 ### Backups
 
-A StartOS backup captures the entire wallet directory, so restoring a backup returns the wallet exactly as it was. If you only have the recovery phrase, install Bark, choose **Restore**, and re-enter the words — balances rebuild from the Ark server.
+Bark is different from most wallets: **a stale backup loses funds.** Every Ark or Lightning payment advances the wallet state, so restoring an out-of-date copy rolls your wallet back to when that copy was taken — **any Ark or Lightning funds you received or moved since then can be permanently lost** (the Ark server cannot rebuild them, and your seed alone can't either). On-chain funds, and balances untouched since that moment, stay recoverable from your seed. That's why a backup only protects you if it is **current** when you restore it.
+
+Because of this, this package backs your wallet up **continuously** to a target you choose, instead of relying only on periodic StartOS backups.
+
+A **local backup always runs** on this server automatically — no setup needed, and it's included whenever you take a StartOS backup. It stays current day to day, but if you lose this server you can only get it back from a StartOS backup, which you take **manually** — so it's usually older than your real balance by the time you need it. For protection you can rely on, add an **external** target, which updates live and off-box:
+
+**Set it up:** Open **Actions → Backups → Configure Backups** and switch on one or more external targets — **Google Drive, Dropbox, Nextcloud, SFTP** (e.g. a NAS or another always-on machine). Each target has an **Enabled** toggle next to its settings; flipping it off later keeps your saved credentials so you can switch it back on without re-entering them. After saving, run **Back Up Now** to confirm it works. From then on, every change to your wallet is snapshotted and uploaded within seconds.
+
+> **Pick an external target on a different machine than this server.** A backup stored on this same box — including the always-on local backup, or a Nextcloud/SFTP server running on this same StartOS — is recoverable only from a manual StartOS backup, so it's likely stale when you lose this server, which is exactly when you need it. Use a separate device (a NAS, another computer) or a third-party provider, where the backup updates live and survives the loss of this box.
+
+**Your backups are encrypted before they leave your server**, with a key derived from your twelve-word recovery phrase, so they are safe to store on third-party services. Two things keep your funds recoverable, and you must keep both:
+
+1. **Your recovery phrase** — the master key. It decrypts your backups. If you lose it, nothing can recover your wallet.
+2. **A current StartOS backup** — small, and it stores *where* your wallet backups live plus the credentials to fetch them. Keep taking StartOS backups (the wallet database is no longer inside them — it lives at your chosen target — but the pointer to it is).
+
+**Restoring:** restore your StartOS backup as usual. On startup the service automatically pulls the **freshest** wallet snapshot from your target(s), decrypts it with your seed, and loads it — so you come back to your most recent state, not a stale one. (If no target was ever configured, or none can be reached, the wallet starts fresh from your seed with on-chain-only recovery.)
+
+> **Don't roll your backup target back to an older state**, and ideally use **two independent targets**. If you restore the target itself (e.g. your Nextcloud) from an old backup, the wallet copy on it becomes stale. The service detects this — if the newest copy it finds is older than what it last sent, it **refuses to load it** (to avoid reverting your wallet and losing funds) and asks you to provide a current copy. With two targets, a rolled-back one is simply outvoted by the fresh one.
 
 ## Limitations
 

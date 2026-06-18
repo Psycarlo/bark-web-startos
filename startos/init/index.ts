@@ -6,6 +6,8 @@ import { sdk } from '../sdk'
 import { versionGraph } from '../versions'
 import { seedFiles } from './seedFiles'
 import { taskSetPassword } from './taskSetPassword'
+import { taskAcknowledgeRisk } from './taskAcknowledgeRisk'
+import { taskAddBackupTarget } from './taskAddBackupTarget'
 
 export const init = sdk.setupInit(
   restoreInit,
@@ -15,6 +17,8 @@ export const init = sdk.setupInit(
   setDependencies,
   actions,
   taskSetPassword,
+  taskAcknowledgeRisk,
+  taskAddBackupTarget,
 )
 
 export const uninit = sdk.setupUninit(versionGraph)

@@ -59,11 +59,18 @@ The `barkd` binary is fetched from the upstream GitLab release with a pinned SHA
 
 Everything the wallet persists lives under `/data/.bark`:
 
-- `db.sqlite` — wallet database
+- `db.sqlite` — wallet database (shipped externally by the backup agent; **excluded** from the native StartOS backup)
 - `mnemonic` — seed
 - `auth_token` — barkd bearer token (never reaches the browser)
+- `.backup-state.json` — backup agent status (excluded from native backup)
 
-`/data/store.json` holds StartOS-managed state separate from the wallet — currently the `uiPassword` enforced by the reverse-proxy basic-auth gate.
+Package-level state on `/data`:
+
+- `store.json` — `uiPassword` enforced by the reverse-proxy basic-auth gate
+- `backup-config.json` — continuous-backup target(s) + credentials (base64 rclone config; the restore "pointer")
+- `startupFlags.json` — `pendingRestore` flag set by `setPostRestore`, consumed by the `restore-pull` oneshot
+- `backup-watermark.json` — newest shipped generation; restore's "newest known" witness (included in native backup)
+- `local-backups/` — encrypted snapshots for the always-on local backup (included in native backup; same-box safety floor)
 
 ---
 
@@ -72,6 +79,13 @@ Everything the wallet persists lives under `/data/.bark`:
 A `mkdir -p /data/.bark` oneshot runs before `barkd` starts on every launch. On first run the wallet is empty — the user creates or restores a wallet through the web UI.
 
 The web interface is gated by HTTP basic auth enforced at the StartOS reverse proxy (username `admin`). On init, a critical **Set UI Password** task is created whenever `store.json` has no `uiPassword`, so a fresh install cannot serve the wallet until the user generates a password.
+
+**Backups always run locally** (the agent ships to `/data/local-backups` unconditionally), so there's no "backups off" state. Two **one-time onboarding tasks** are created on first install (`kind === 'install'`, not reactive — they aren't re-created if the user later removes targets; the health check is the ongoing indicator):
+
+- `startos/init/taskAcknowledgeRisk.ts` → a **critical** task pointing at the **Backup Safety** action (`accept-backup-risk`): a required, informed acknowledgement that the user understands funds can be lost without an external backup **and** a safeguarded seed. Submitting without accepting throws; accepting returns no result and records `riskAccepted`. Clears only when acknowledged — required regardless of target config (not auto-cleared by adding an external target).
+- `startos/init/taskAddBackupTarget.ts` → an **important** task pointing at **Configure Backups**. Clears when that action runs.
+
+Ongoing protection is surfaced by the **Wallet Backup** health check: **failure** while no external target is configured (the local backup is recoverable only via a manual, stale-prone StartOS backup), **success with the last-backup time** once one is.
 
 ---
 
@@ -108,21 +122,36 @@ Ports 4000 (barkd) and 4001 (api) are bound to `127.0.0.1` only and are never ex
 
 ## Actions (StartOS UI)
 
-| Action            | ID                | Purpose                                                                 |
-| ----------------- | ----------------- | ---------------------------------------------------------------------- |
-| Set UI Password   | `set-ui-password` | Generate a new random password for the web UI login (username `admin`) |
+| Action                 | ID                 | Purpose                                                                              |
+| ---------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| Set UI Password        | `set-ui-password`   | Generate a new random password for the web UI login (username `admin`)               |
+| Configure Backups      | `configure-backup`  | Add/configure **external** backup targets (Drive, Dropbox, Nextcloud, SFTP). Important-task target. |
+| Backup Safety          | `accept-backup-risk`| Acknowledge (toggle) that funds can be lost without a current external backup and a safeguarded seed. Critical-task target. |
+| Back Up Now            | `backup-now`        | Run one backup cycle immediately (local + any externals) via a temp subcontainer     |
 
-Created as a critical task on first install (and any time `uiPassword` is missing); also runnable on demand to rotate the password.
+**Set UI Password** is created as a critical task on first install (and any time `uiPassword` is missing); also runnable on demand to rotate the password. The backup actions live in the **Backups** group.
 
 ---
 
 ## Backups and Restore
 
-**Included in backup:**
+A stale Bark database means **permanent fund loss** (forfeited input VTXOs become unspendable; VTXOs created after the snapshot are absent), and the Ark server cannot reconstruct wallet state from the seed today — so seed-only restore is *not* a recovery path. The native StartOS backup is point-in-time and stops the service, so it cannot capture a fast-moving wallet safely. This package therefore ships a **continuous external backup** and narrows the native backup to a pointer.
 
-- `main` volume (the entire `/data/.bark` wallet directory)
+**Continuous backup (`backup-agent.sh`, the `backup-agent` daemon):** a sidecar watches `/data/.bark/db.sqlite` with `inotifywait` (plus an unconditional ~5-minute backstop timer). On any change it debounces, takes a consistent snapshot with `sqlite3 VACUUM INTO`, skips if the snapshot hash is unchanged, encrypts via an rclone `crypt` remote whose password is derived from the wallet mnemonic (`HMAC-SHA256(mnemonic, context)`), and `rclone copy`s the ciphertext to every enabled target. Status is written to `/data/.bark/.backup-state.json`.
 
-**Restore behavior:** the volume is fully restored before the service starts, returning the wallet exactly as it was. A user holding only the twelve-word seed can instead choose **Restore** in the web UI and rebuild balances from the Ark server.
+We chose inotify-on-the-DB over barkd's WebSocket movement stream deliberately: it fires on *every* mutation (including silent on-chain/BDK writes), needs no ticket/auth dance, and can't miss events.
+
+**Native StartOS backup (`startos/backups.ts`):** `ofVolumes('main')` with `db.sqlite` (and its journal/wal/shm and `.backup-state.json`) **excluded**. What remains is the small, static pointer: `.bark/mnemonic`, `.bark/auth_token`, `store.json` (UI password), and `backup-config.json` (target location + credentials). `setPostRestore` sets `pendingRestore: true` in `startupFlags.json`.
+
+**Restore behavior:** after the native restore, the `restore-pull` oneshot (`main.ts`, ordered **before** `barkd`) runs `backup-agent.sh --restore`: if `pendingRestore` is set and a target is configured, it derives the key from the restored mnemonic, pulls each target's freshness marker, seeds `db.sqlite` from the **freshest** target (decrypt + integrity-check), and writes it before barkd opens it. On success it clears the flag and advances the watermark; if no target is reachable it leaves the flag set (retry next start) and barkd starts fresh from the seed.
+
+**Staleness guard (rolled-back target).** A target the user backs up and later restores can be silently reverted to an older state — which would revert the wallet and lose funds. Each snapshot carries a monotonic generation (`wallet.meta`, ship time, encrypted alongside `wallet.db.bin`), and the latest generation is recorded in `backup-watermark.json` on `/data` — which **is** included in the native StartOS backup, so it travels back on restore as an independent "newest known" witness. On restore, if even the freshest target's generation is **older than the watermark**, the target has been rolled back: the oneshot **refuses to seed** (writes a `lastError`, surfaced by the health check, and leaves the flag set), barkd starts with no wallet so the target is **not** overwritten, and the user is told to replace the target with a current copy. Limit: with a single target, a rollback to a point *after* the last StartOS backup can't be detected (the watermark is only as fresh as the last native backup) — **use 2+ independent targets** so a rolled-back one is outvoted by a fresh one (restore picks the max generation).
+
+**Encryption & keys:** the snapshot contains the plaintext `mnemonic`, so egress is always encrypted. The key is seed-derived (no separate passphrase, automatic restore); decrypting a backup requires the seed, which is already full wallet control, so the backup grants no extra access. Losing the seed = total loss (the backup can't help). The native backup is itself encrypted under the user's StartOS password and carries the target credentials.
+
+**Always-on local target:** the agent unconditionally ships to an on-box rclone `local` remote at `/data/local-backups` (fixed managed path, no credentials, not user-configurable). Unlike the live `db.sqlite`, this folder is **not** excluded from the native StartOS backup — its encrypted snapshots ride along as a same-box recovery floor. On restore it's just another target in the freshness comparison; because it's captured in the native backup alongside the watermark, its generation equals the floor, so a fresher off-box target always wins and `local` is never authoritative. After losing the box it survives only inside the native StartOS backup — which is manual and point-in-time, so at restore it's typically stale; an external target stays current and is what makes recovery you can rely on.
+
+**External targets:** Google Drive, Dropbox, Nextcloud (WebDAV), and SFTP via a bundled `rclone` — added in the **Configure Backups** action. Each is a top-level object with an **`Enabled` toggle** alongside its settings, so toggling one off keeps its saved credentials (the section stays in `rcloneConfig`; only `selectedRcloneRemotes` — the externals the agent ships to — changes). Secrets are rclone-obscured. `localhost`/`127.0.0.1`/`::1`/`0.0.0.0` and `.onion` targets are rejected at config time (a same-box service can't survive losing this box; no SOCKS proxy in this image yet), and the action warns to use independent hardware. `ship()` requires **all** targets (local + externals) to succeed, so a failing external surfaces as a health failure and is retried.
 
 ---
 
@@ -131,8 +160,9 @@ Created as a critical task on first install (and any time `uiPassword` is missin
 | Check         | Method                | Surfaced | Messages                                                      |
 | ------------- | --------------------- | -------- | ------------------------------------------------------------- |
 | Web Interface | Port listening (8080) | Yes      | "The web interface is ready" / "The web interface is not ready" |
+| Wallet Backup | Reads `backup-config.json` + `.backup-state.json` | Yes | `failure` (no external target configured), `success` ("Last backup Nm ago" once shipping; "no backup yet" until the wallet has activity), `failure` (external configured but backups erroring) |
 
-`barkd` (4000) and `api` (4001) readiness gate daemon startup ordering but are not displayed to the user.
+`barkd` (4000), `api` (4001), and the `backup-agent` daemon readiness gate startup ordering but are not displayed directly; backup health is surfaced via the standalone **Wallet Backup** check.
 
 ---
 
@@ -163,12 +193,15 @@ package_id: bark-web
 image: custom (bark.Dockerfile)
 architectures: [x86_64, aarch64]
 volumes:
-  main: /data   # wallet at /data/.bark, package store at /data/store.json
+  main: /data   # wallet at /data/.bark; db.sqlite EXCLUDED from native backup (shipped externally)
+                # pointers in native backup: store.json, backup-config.json, startupFlags.json, .bark/mnemonic
 ports:
   ui: 8080      # basic-auth gated at the OS reverse proxy (user: admin)
   barkd: 4000   # localhost only, not exposed
   api: 4001     # localhost only, not exposed
 dependencies: none
+daemons: [barkd, api, nginx, backup-agent]   # backup-agent: continuous encrypted external backup
+backup_targets: { local: always-on (on-box, in native backup), external: [gdrive, dropbox, nextcloud, sftp] }   # via bundled rclone; loopback/.onion rejected
 startos_managed_env_vars:
   - PORT
   - WALLET_DIR
@@ -178,5 +211,9 @@ startos_managed_env_vars:
   - CHAIN_SOURCE
   - BARK_NETWORK
 actions:
-  - set-ui-password   # generate/rotate the web UI password (basic auth, user: admin)
+  - set-ui-password    # generate/rotate the web UI password (basic auth, user: admin)
+  - configure-backup   # add/configure external backup targets (important-task target)
+  - accept-backup-risk # acknowledge stale-backup fund-loss risk (critical-task target)
+  - backup-now         # run one backup cycle immediately (local + externals)
+encryption: snapshot encrypted via rclone crypt; key = HMAC-SHA256(mnemonic) (seed-derived)
 ```
