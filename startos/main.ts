@@ -11,6 +11,7 @@ import {
   barkNetwork,
   chainSource,
   uiPasswordFile,
+  uiSessionSecretFile,
   uiPort,
   walletDataPath,
   walletDir,
@@ -50,14 +51,17 @@ export const main = sdk.setupMain(async ({ effects }) => {
     })
     .addOneshot('write-ui-password', {
       // Materialize the UI password from store.json into a mode-600 file the API
-      // reads (UI_PASSWORD_FILE). jq reads/writes files directly so the secret
-      // never appears in process args; umask 077 makes the file owner-only.
+      // reads (UI_PASSWORD_FILE), at the volume root — NOT in barkd's datadir.
+      // jq reads/writes files directly so the secret never appears in process
+      // args; umask 077 makes the file owner-only. Also sweep any stale UI-auth
+      // files a previous build wrote inside the datadir, which would otherwise
+      // make barkd reject wallet creation ("Datadir has unexpected contents").
       subcontainer: barkdSub,
       exec: {
         command: [
           'sh',
           '-c',
-          `umask 077 && jq -r '.uiPassword // ""' /data/store.json > ${uiPasswordFile}`,
+          `umask 077 && jq -r '.uiPassword // ""' /data/store.json > ${uiPasswordFile} && rm -f ${walletDir}/ui_password ${walletDir}/ui_session_secret`,
         ],
       },
       requires: ['init-data'],
@@ -113,6 +117,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
           BARK_NETWORK: barkNetwork,
           UI_AUTH: 'true',
           UI_PASSWORD_FILE: uiPasswordFile,
+          UI_SESSION_SECRET_FILE: uiSessionSecretFile,
         },
       },
       ready: {
