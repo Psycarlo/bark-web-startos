@@ -5,8 +5,12 @@ export const barkdPort = 4000
 export const walletDir = '/data/.bark'
 // Display-only path shown in the wallet's backup-reminder UI; must match walletDir.
 export const walletDataPath = `${walletDir}/`
-// UI password materialized from store.json for the API's UI_PASSWORD_FILE gate.
-export const uiPasswordFile = `${walletDir}/ui_password`
+// UI-auth files live at the volume ROOT, not inside walletDir. barkd treats its
+// datadir (/data/.bark) as wallet-owned and aborts wallet creation if it finds
+// any unrecognized file there ("Datadir has unexpected contents"). Keeping these
+// under /data (a sibling of .bark) leaves the datadir clean for barkd.
+export const uiPasswordFile = `/data/ui_password`
+export const uiSessionSecretFile = `/data/ui_session_secret`
 
 // Continuous-backup paths. The shell agent (backup-agent.sh) hardcodes the
 // matching absolute paths — keep the two in sync.
